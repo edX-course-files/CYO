@@ -1,0 +1,937 @@
+---
+title: "Evaluation of tumor mutation burden with targeted next generation sequencing panels"
+output: pdf_document
+header-includes:
+    - \usepackage{setspace}\doublespacing
+fontsize: 12pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, message=FALSE)
+```
+
+
+```{r libraries}
+
+if(!require(broom)) install.packages("broom", repos = "http://cran.us.r-project.org")
+library("broom")
+
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+library("caret")
+
+if(!require(gam)) install.packages("gam", repos = "http://cran.us.r-project.org")
+library("gam")
+
+if(!require(gridExtra)) install.packages("gridExtra", repos = "http://cran.us.r-project.org")
+library("gridExtra")
+
+if(!require(kableExtra)) install.packages("kableExtra", repos = "http://cran.us.r-project.org")
+library("kableExtra")
+ 
+if(!require(readxl)) install.packages("readxl", repos = "http://cran.us.r-project.org")
+library("readxl")
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+library("tidyverse")
+
+if(!require(tinytex)) install.packages("tinytex", repos = "http://cran.us.r-project.org")
+library("tinytex")
+#tinytex::install_tinytex()
+
+#if(!require(GenomicRanges)) install.packages("GenomicRanges", repos = "http://cran.us.r-project.org")
+#library("GenomicRanges")
+#GenomicRanges masks objects in tidyverse; only install GenomicRanges where used in code chunk "Filter TCGA exome variant calls on KDL targeted panel regions"
+
+```
+
+
+```{r data files}
+
+## TCGA EXOME VARIANT CALLS
+# TCGA exome MAF files from https://gdac.broadinstitute.org/
+# Stored in local institutional shared archive 'X:/_FireBrowse_TCGA/MAF'
+# Individual MAF files are Mutation_Packager_Calls.Level_3.2016012800.0.0
+# NCBI build 37/hg19
+# Exome region is 38 Mb
+
+
+## TARGETED PANEL REGION DEFINITIONS
+# MSK-IMPACT panel gene list; panel covers 468 entire genes; panel region is 1.2 Mb
+MSK_IMPACT_468 <- read_excel("DataFiles/MSK_IMPACT_Targets.xlsx", sheet = "MSK master list")
+
+# KDL GeneTrails panel BED file; panel includes all or part of 225 genes; panel region is 0.61 Mb
+KDL_225 <- read.delim("DataFiles/KDL_225_roi_bed.txt")
+
+
+```
+
+
+```{r concatenate TCGA exome files}
+
+# TCGA exome variant calls are in one MAF file per sample
+# Read each file into a list, then concatenate the files into one master data frame
+
+MAF_files = list.files(path = "DataFiles/MAF",
+                       pattern="*.maf.txt", 
+                       full.names = TRUE)
+
+MAF_list = lapply(MAF_files, read.delim)
+
+TCGA_MAF = do.call(rbind, MAF_list)
+
+TCGA_MAF_select <- TCGA_MAF %>%
+                    select(Tumor_Sample_Barcode,
+                           Chromosome, 
+                           Start_position, 
+                           End_position,
+                           Reference_Allele,
+                           Tumor_Seq_Allele2,
+                           Hugo_Symbol,
+                           TranscriptID,
+                           AAChange,
+                           Variant_Classification,
+                           Variant_Type,
+                           NCBI_Build,
+                           Diagnosis)
+
+
+# Evaluate Variant_Classification terms; identify those that encompass nonsynonymous variants
+# table(TCGA_MAF_select$Variant_Classification)
+
+# Filter on Variant_Classification terms that capture nonsynonymous variants
+TCGA_MAF_nonsyn <- TCGA_MAF_select %>%
+                            filter(Variant_Classification %in% c("De_novo_Start_InFrame",
+                                                                 "Frame_Shift_Del",
+                                                                 "Frame_Shift_Ins",
+                                                                 "In_Frame_Del",
+                                                                 "In_Frame_Ins",
+                                                                 "Indel",
+                                                                 "Missense",
+                                                                 "Missense_Mutation",
+                                                                 "Nonsense_Mutation",
+                                                                 "Nonstop_Mutation",
+                                                                 "Splice_Site",
+                                                                 "Splice_Site_Del",
+                                                                 "Splice_Site_Ins")) 
+                            
+```
+
+
+```{r Tabulate TMB by cancer type in TCGA exomes, fig1}
+
+# Tabulate number of TCGA samples by cancer type
+TCGA_sample_count <- TCGA_MAF_nonsyn %>%
+                     group_by(Diagnosis) %>%
+                     summarize(Count = n_distinct(Tumor_Sample_Barcode))
+#sum(TCGA_sample_count$Count)
+#nrow(TCGA_sample_count)
+
+# Boxplot of TCGA exome TMB estimates by cancer type 
+# Exome size is 38 Mb; divide nonsynonymous variant count by 38 for nonsynonymous/Mb
+Exome_TMB <- TCGA_MAF_nonsyn %>%
+                 group_by(Diagnosis, Tumor_Sample_Barcode) %>%
+                 summarize(Exome_nonsyn_count = n()) %>%
+                 mutate(Exome_nonsyn_per_Mb = (Exome_nonsyn_count/38))
+
+plot_Exome_TMB <- Exome_TMB %>%
+                 ggplot(aes(x = reorder(Diagnosis, Exome_nonsyn_per_Mb, FUN = median), 
+                            y = Exome_nonsyn_per_Mb)) +
+                  geom_boxplot() +
+                  scale_y_log10(breaks = c(0.1, 1, 10, 100, 1000),
+                                labels = c(0.1, 1, 10, 100, 1000)) +
+                  annotation_logticks(base = 10, 
+                          sides = "l", 
+                          scaled = TRUE, 
+                          short = unit(0.5, "mm"), 
+                          mid = unit(0.6, "mm"), 
+                          long = unit(0.7, "mm")) +
+                  theme(axis.text = element_text(size = 10),
+                        axis.text.x = element_text(angle = 90, 
+                                       hjust = 1,
+                                       vjust = 0.3),
+                        axis.title = element_text(size = 14, 
+                              face = "bold"),
+                       plot.caption = element_text(size = 10,
+                                                   hjust = 0.05),
+                       panel.grid.minor = element_blank()) +
+                  xlab("\nDiagnosis") +
+                  ylab("Exome tumor mutation burden\n (Nonsynonymous mutations per Mb)")
+                  
+                
+#plot_Exome_TMB
+
+```
+
+
+```{r Filter TCGA exome variant calls on MSK-IMPACT targeted panel region}
+
+# Tabulate TCGA exome nonsynonymous variant calls that are located in the MSK-IMPACT panel target region
+# Filter TCGA exome variant calls on the MSK-IMPACT targeted panel 468 gene list
+# Divide nonsynonymous variant count by 1.2 Mb MSK-IMPACT panel size to estimate TMB per Mb
+
+Exome_in_MSKpanel <- TCGA_MAF_nonsyn %>%
+                        group_by(Diagnosis, Tumor_Sample_Barcode) %>%
+                        summarize(MSK_nonsyn_count = sum(Hugo_Symbol %in% MSK_IMPACT_468$Gene)) %>%
+                        mutate(MSK_nonsyn_per_Mb = round(MSK_nonsyn_count/1.2,2))
+ 
+```
+
+
+```{r Filter TCGA exome variant calls on KDL targeted panel region, eval = FALSE}
+
+
+# Run the code below to filter the TCGA exome variant calls on the KDL targeted panel region. Store the ouptut file "DataFiles/Exome_in_KDLpanel_df.txt", to avoid rerunning the code below repeatedly.
+
+# Tabulate TCGA exome nonsynonymous variant calls that are located in the KDL panel target region
+# Partial and whole genes are covered, so use genomic region coordinates in BED file
+# Make GRanges of both TCGA exome nonsynonymous variant calls and KDL panel region so that exome variant calls can be intersected on the KDL panel target region
+# GRanges requires "chr" in front of chr number; start, end, strand
+# GENOMIC RANGES MASKS TIDYVERSE OBJECTS; LOAD GENOMIC RANGES ONLY FOR THE STEPS BELOW AND RELOAD TIDYVERSE AFTER
+
+
+#library("GenomicRanges")
+
+# TCGA_MAF_nonsyn_gr <- TCGA_MAF_nonsyn %>% 
+#                         mutate(Chromosome = paste("chr", TCGA_MAF_nonsyn$Chromosome, sep = ""),
+#                                strand = "*")
+#                                
+# TCGA_MAF_nonsyn_GRanges <- makeGRangesFromDataFrame(TCGA_MAF_nonsyn_gr,
+#                                                   seqnames.field="Chromosome",
+#                                                   start.field="Start_position",
+#                                                   end.field="End_position",
+#                                                   strand.field="strand",
+#                                                   keep.extra.columns=TRUE)
+# 
+# KDL_225_gr <- KDL_225 %>%
+#                 mutate(strand = "*")
+# 
+# 
+# KDL_225_GRanges <- makeGRangesFromDataFrame(KDL_225_gr,
+#                                             seqnames.field="Chr",
+#                                             start.field="Start",
+#                                             end.field="End",
+#                                             strand.field="strand",
+#                                             keep.extra.columns=TRUE)
+# 
+# 
+# Exome_in_KDLpanel_GRanges <- GenomicRanges::intersect(TCGA_MAF_nonsyn_GRanges, KDL_225_GRanges)
+# 
+# detach("package:GenomicRanges", unload=TRUE)
+# library(tidyverse)
+# 
+# # Merge filtered variant call genomic range back onto original exome variant call data frame to recapture exome sample metadata 
+# # Tabulate KDL panel TMB per Tumor_Sample_Barcode as nonsynonymous variant calls per Mb; KDL targeted panel is 0.61 Mb
+# # Note that exome samples with no variant calls in KDL panel genomic ranges region will be lost upon intersect; recapture by subsequent merge onto TMB_all with all=TRUE, then convert NA to zero
+# 
+# 
+# Exome_in_KDLpanel_df <- merge(as.data.frame(Exome_in_KDLpanel_GRanges), TCGA_MAF_nonsyn_gr, 
+#                               by.x=c("seqnames", "start", "end"), 
+#                               by.y=c("Chromosome", "Start_position", "End_position"))  %>%
+#                         group_by(Diagnosis, Tumor_Sample_Barcode) %>%
+#                         summarize(KDL_nonsyn_count = n()) %>%
+#                         mutate(KDL_nonsyn_per_Mb = round(KDL_nonsyn_count/0.61,2))
+# 
+#  
+# # Due to conflicts with GenomicRanges and objects in other packages, intersect the exome region on the KDL panel target region and export the ouptut file "DataFiles/Exome_in_KDLpanel_df.txt" once and store the output. Do not rerun the code above again. Instead import the file.
+# 
+# write.table(Exome_in_KDLpanel_df, "DataFiles/Exome_in_KDLpanel_df.txt", sep = "\t")
+
+# Exome_in_KDLpanel_df <- read.delim("DataFiles/Exome_in_KDLpanel_df.txt")
+ 
+```
+
+
+```{r Combine TMB estimates for exome, MSK panel and KDL panel into one data frame}
+
+Exome_in_KDLpanel_df <- read.delim("DataFiles/Exome_in_KDLpanel_df.txt")
+
+TMB_all <- merge(merge(Exome_TMB, Exome_in_MSKpanel, by = c("Diagnosis", "Tumor_Sample_Barcode")),
+                  Exome_in_KDLpanel_df, by = c("Diagnosis", "Tumor_Sample_Barcode"), all = TRUE)
+           
+TMB_all[is.na(TMB_all)] <- 0
+
+#glimpse(TMB_all)
+
+```
+
+
+```{r Visualize TMB estimates tabulated from TCGA exomes and targeted panel regions, fig2 to fig6}
+
+# Focus on 2 cancer types where TMB is most clinically relevant
+# TCGA lung adenocarcinoma (LUAD) and skin cutaneous melanoma (SKCM) samples
+
+# Make tidy
+TMB_tidy_count <- TMB_all %>% 
+                      gather(., Exome_nonsyn_count, MSK_nonsyn_count, KDL_nonsyn_count, 
+                             key = Target_region, 
+                             value = Raw_nonsyn_count) %>% 
+                       mutate(Target_region = str_replace(Target_region, "nonsyn_count", "region"))
+                       
+TMB_tidy_per_Mb <- TMB_all %>% 
+                    gather(., Exome_nonsyn_per_Mb, MSK_nonsyn_per_Mb, KDL_nonsyn_per_Mb, 
+                             key = Target_region, 
+                             value = Nonsyn_per_Mb) %>% 
+                        mutate(Target_region = str_replace(Target_region, "nonsyn_per_Mb", "region"))
+
+TMB_tidy_all <- merge(TMB_tidy_count,TMB_tidy_per_Mb,
+                      by = c("Diagnosis", 
+                             "Tumor_Sample_Barcode", 
+                             "Target_region")) %>%
+                select("Diagnosis", 
+                       "Tumor_Sample_Barcode", 
+                       "Target_region",
+                       "Raw_nonsyn_count",
+                       "Nonsyn_per_Mb")
+
+
+TMB_tidy_LS <- TMB_tidy_all %>% 
+               mutate(Target_region = factor(Target_region)) %>%
+               filter(Diagnosis %in% c("LUAD",
+                                       "SKCM"))
+
+
+# Density plot with raw TMB values
+TMB_density_plot <- TMB_tidy_LS %>%
+                      group_by(Target_region, Diagnosis) %>%
+                      ggplot(aes(x = Nonsyn_per_Mb, color = Target_region)) +
+                        geom_density(size = 1) +
+                        xlim(c(0,30)) +
+                        facet_wrap(Diagnosis ~ ., 
+                                   ncol = 1,
+                                   scales = "free_y",
+                                   strip.position="top",
+                                   labeller = labeller(Diagnosis = c(LUAD = "Lung adenocarcinoma (LUAD)",
+                                                                     SKCM ="Skin cutaneous melanoma (SKCM)"))) +
+                         xlab("TMB (Nonsynonymous variants/ Mb)") +
+                         ylab("Density") +
+                         scale_color_hue(name = "Target region",
+                                            labels = c("Exome",
+                                                       "KDL panel",
+                                                        "MSK panel")) +
+                         theme(strip.text.x = element_text(size = 14, 
+                                                           face = "bold"),
+                               axis.title = element_text(size = 12,
+                                                         face = "bold"),
+                               legend.title = element_text(size = 8),
+                               legend.text = element_text(size = 8),
+                               legend.justification = c(0.98,0.98),
+                               legend.position = c(0.98,0.98))
+#TMB_density_plot
+
+
+# Density plot with scaled TMB values
+TMB_scaled_density_plot <- TMB_tidy_LS %>%
+                             group_by(Target_region, Diagnosis) %>%
+                             mutate(scaled_TMB = scale(Nonsyn_per_Mb)) %>%
+                             filter(scaled_TMB >=-3 & scaled_TMB <=3) %>%
+                             ggplot(aes(x = scaled_TMB, color = Target_region)) +
+                             geom_density(size = 1) +
+                             facet_wrap(Diagnosis ~ ., 
+                                        ncol = 1,
+                                        scales = "free_y",
+                                        strip.position="top",
+                                        labeller = labeller(Diagnosis = c(LUAD = "Lung adenocarcinoma (LUAD)",
+                                                                          SKCM ="Skin cutaneous melanoma (SKCM)"))) +
+                            xlab("Scaled tumor mutation burden") +
+                            ylab("Density") +
+                            scale_color_hue(name = "Target region",
+                                            labels = c("Exome",
+                                                       "KDL panel",
+                                                       "MSK panel")) +
+                            theme(strip.text.x = element_text(size = 14, 
+                                                              face = "bold"),
+                                  axis.title = element_text(size = 12,
+                                                            face = "bold"),
+                                  legend.title = element_text(size = 8),
+                                  legend.text = element_text(size = 8),
+                                  legend.justification = c(0.98,0.98),
+                                  legend.position = c(0.98,0.98))
+#TMB_scaled_density_plot
+
+
+# QQ plot
+TMB_QQ_plot <- TMB_tidy_LS %>%
+                 group_by(Target_region, Diagnosis) %>%
+                 mutate(scaled_TMB = scale(Nonsyn_per_Mb)) %>%
+                 filter(scaled_TMB >=-4 & scaled_TMB <=4) %>%
+                 ggplot(aes(sample = scaled_TMB, color = Target_region)) +
+                   geom_qq() +
+                   geom_abline() +
+                   facet_wrap(Target_region ~ Diagnosis, 
+                              ncol = 2) +
+                   xlab("Theoretical") +
+                   ylab("Sample") + 
+                   ggtitle("Lung                Melanoma") +
+                   scale_color_hue(name = "Target region",
+                                   labels = c("Exome",
+                                              "KDL panel",
+                                              "MSK panel")) +
+                   theme(strip.text.x = element_blank(),
+                         axis.text = element_text(size = 12),
+                         axis.title = element_text(size = 14, 
+                                                   face = "bold"),
+                         legend.title = element_text(size = 10),
+                         legend.text = element_text(size = 10),
+                         legend.position = "right",
+                         plot.title = element_text(size = 16,
+                                                   face = "bold"))
+                           
+#TMB_QQ_plot
+
+
+# linear regression
+Exome_vs_KDL_lm <- TMB_all %>%
+                         filter(Diagnosis %in% c("LUAD",
+                                                 "SKCM")) %>%
+                         group_by(Diagnosis) %>%
+                         filter(Exome_nonsyn_per_Mb <= 100) %>%
+                         ggplot(aes(x = KDL_nonsyn_per_Mb,
+                                    y = Exome_nonsyn_per_Mb)) +
+                        geom_point(color = "forestgreen") +
+                        #geom_abline(color = "red",
+                                    # linetype = "dotted") +
+                        geom_smooth(method = "lm",
+                                    color = "black") +
+                        facet_wrap(Diagnosis ~ ., 
+                                   strip.position="top",
+                                   labeller = labeller(Diagnosis = c(LUAD = "Lung",
+                                                                     SKCM ="Melanoma"))) +
+                        xlab("KDL panel tumor mutation burden") +
+                        ylab("Exome tumor mutation burden") +
+                        theme(strip.text.x = element_text(size = 14, 
+                                                          face = "bold"),
+                              axis.title = element_text(size = 12, 
+                                                   face = "bold"))
+#Exome_vs_KDL_lm
+
+
+MSK_vs_KDL_lm <- TMB_all %>%
+                         filter(Diagnosis %in% c("LUAD",
+                                                 "SKCM")) %>%
+                         group_by(Diagnosis) %>%
+                         filter(Exome_nonsyn_per_Mb <= 100) %>%
+                         ggplot(aes(x = KDL_nonsyn_per_Mb,
+                                    y = MSK_nonsyn_per_Mb)) +
+                        geom_point(color = "royalblue2") +
+                        # geom_abline(color = "red",
+                        #             linetype = "dotted") +
+                        geom_smooth(method = "lm",
+                                    color = "black") +
+                        facet_wrap(Diagnosis ~ ., 
+                                   strip.position="top",
+                                   labeller = labeller(Diagnosis = c(LUAD = "Lung",
+                                                                     SKCM ="Melanoma"))) +
+                        xlab("KDL panel tumor mutation burden") +
+                        ylab("MSK panel tumor mutation burden") +
+                        theme(strip.text.x = element_text(size = 14, 
+                                                          face = "bold"),
+                              axis.title = element_text(size = 12, 
+                                                   face = "bold"))
+#MSK_vs_KDL_lm
+
+
+
+```
+
+
+```{r binarize outcome, create train and test data sets}
+
+# Will use exome region TMB estimate as truth, and determine how well the KDL panel and MSK panel regions classify the TCGA exome samples as TMB-high or TMB-low 
+
+
+# For exome TMB >= 10, set sample_exome_TMB = TMB_high 
+# For exome TMB < 10, set sample_exome_TMB = TMB_low
+# Set TMB_high = 1, TMB_low = 0
+
+TMB_all_bin <- TMB_all %>% 
+                filter(Diagnosis %in% c("LUAD",
+                                        "SKCM")) %>% 
+               mutate(sample_exome_TMB = (Exome_nonsyn_per_Mb >= 10)*1)
+
+LUAD_bin <- TMB_all_bin %>% filter(Diagnosis == "LUAD")
+SKCM_bin <- TMB_all_bin %>% filter(Diagnosis == "SKCM")
+
+
+# partition into 75% train_set, 25% test_set for each cancer type
+
+# Lung adenocarcinoma (LUAD )
+set.seed(27)
+test_index_LUAD <- createDataPartition(LUAD_bin$Exome_nonsyn_per_Mb, 
+                                  times = 1, 
+                                  p = 0.25, 
+                                  list = FALSE) 
+  train_LUAD <- LUAD_bin[-test_index_LUAD, ]   
+  test_LUAD <- LUAD_bin[test_index_LUAD, ]  
+  
+# Skin cutaneous melanoma (SKCM)
+set.seed(27)
+test_index_SKCM <- createDataPartition(SKCM_bin$Exome_nonsyn_per_Mb, 
+                                  times = 1, 
+                                  p = 0.25, 
+                                  list = FALSE) 
+  train_SKCM <- SKCM_bin[-test_index_SKCM, ]   
+  test_SKCM <- SKCM_bin[test_index_SKCM, ]  
+  
+
+```
+
+
+```{r linear regression model (lm); TMB values in exome and targeted panels, table1}
+
+# caret lm
+# Use linear regression model with KDL targeted panel TMB values as predictors
+# Outcomes are the TMB values in the same TCGA samples, as measured with exome or MSK targeted panel
+# Capture R squared, slope, intercept
+# Evaluate TCGA lung adenocarcinoma (LUAD) and skin cutaneous melanoma (SKCM) samples
+
+
+control <- trainControl(method = "cv", number = 10, p = 0.9)
+
+# Lung adenocarcinoma (LUAD)
+# KDL panel (x) vs exome (y)
+train_lm <- train(Exome_nonsyn_per_Mb ~ KDL_nonsyn_per_Mb, 
+             data = train_LUAD,
+             method = "lm",
+             trControl = control,
+             metric = "Rsquared")
+
+y_hat_lm <-predict(train_lm, test_LUAD)
+rsquared <- (cor(test_LUAD$Exome_nonsyn_per_Mb, y_hat_lm))^2
+
+modelvalues <-data.frame(obs=test_LUAD$Exome_nonsyn_per_Mb, pred=y_hat_lm)
+tidy_table <- tidy(lm(obs ~ pred, data = modelvalues), conf.int = TRUE)
+
+lm_results <- data_frame(Diagnosis = "LUAD",
+                         `Comparison` = "Exome vs KDL panel",
+                          `R squared` = round(rsquared,2), 
+                         Slope = round(tidy_table$estimate[2],2),
+                         `Slope SE` = round(tidy_table$std.error[2],2),
+                         `Y int` = round(tidy_table$estimate[1],2),
+                         `Y int SE` = round(tidy_table$std.error[1],2)
+                         )
+
+# Lung adenocarcinoma (LUAD)
+# KDL panel (x) vs MSK panel (y)
+train_lm <- train(MSK_nonsyn_per_Mb ~ KDL_nonsyn_per_Mb, 
+             data = train_LUAD,
+             method = "lm",
+             trControl = control,
+             metric = "Rsquared")
+
+y_hat_lm <-predict(train_lm, test_LUAD)
+rsquared <- (cor(test_LUAD$MSK_nonsyn_per_Mb, y_hat_lm))^2
+
+modelvalues <-data.frame(obs=test_LUAD$MSK_nonsyn_per_Mb, pred=y_hat_lm)
+tidy_table <- tidy(lm(obs ~ pred, data = modelvalues), conf.int = TRUE)
+
+lm_results <- bind_rows(lm_results,
+                        data_frame(Diagnosis = "LUAD",
+                         `Comparison` = "MSK panel vs KDL panel",
+                          `R squared` = round(rsquared,2), 
+                         Slope = round(tidy_table$estimate[2],2),
+                         `Slope SE` = round(tidy_table$std.error[2],2),
+                         `Y int` = round(tidy_table$estimate[1],2),
+                         `Y int SE` = round(tidy_table$std.error[1],2)
+                         ))
+
+ 
+# Skin cutaneous melanoma (SKCM)
+# KDL panel vs exome
+train_lm <- train(Exome_nonsyn_per_Mb ~ KDL_nonsyn_per_Mb, 
+             data = train_SKCM,
+             method = "lm",
+             trControl = control,
+             metric = "Rsquared")
+
+y_hat_lm <-predict(train_lm, test_SKCM)
+rsquared <- (cor(test_SKCM$Exome_nonsyn_per_Mb, y_hat_lm))^2
+
+modelvalues <-data.frame(obs=test_SKCM$Exome_nonsyn_per_Mb, pred=y_hat_lm)
+tidy_table <- tidy(lm(obs ~ pred, data = modelvalues), conf.int = TRUE)
+
+lm_results <- bind_rows(lm_results,
+                        data_frame(Diagnosis = "SKCM",
+                         `Comparison` = "Exome vs KDL panel",
+                          `R squared` = round(rsquared,2), 
+                         Slope = round(tidy_table$estimate[2],2),
+                         `Slope SE` = round(tidy_table$std.error[2],2),
+                         `Y int` = round(tidy_table$estimate[1],2),
+                         `Y int SE` = round(tidy_table$std.error[1],2)
+                         ))
+
+
+# Skin cutaneous melanoma (SKCM)
+# KDL panel vs MSK panel
+train_lm <- train(MSK_nonsyn_per_Mb ~ KDL_nonsyn_per_Mb, 
+             data = train_SKCM,
+             method = "lm",
+             trControl = control,
+             metric = "Rsquared")
+
+y_hat_lm <-predict(train_lm, test_SKCM)
+rsquared <- (cor(test_SKCM$MSK_nonsyn_per_Mb, y_hat_lm))^2
+
+modelvalues <-data.frame(obs=test_SKCM$MSK_nonsyn_per_Mb, pred=y_hat_lm)
+tidy_table <- tidy(lm(obs ~ pred, data = modelvalues), conf.int = TRUE)
+
+lm_results <- bind_rows(lm_results,
+                        data_frame(Diagnosis = "SKCM",
+                         `Comparison` = "MSK panel vs KDL panel",
+                          `R squared` = round(rsquared,2), 
+                         Slope = round(tidy_table$estimate[2],2),
+                         `Slope SE` = round(tidy_table$std.error[2],2),
+                         `Y int` = round(tidy_table$estimate[1],2),
+                         `Y int SE` = round(tidy_table$std.error[1],2)
+                         ))
+
+
+# knitr::kable(lm_results) %>%
+#   kable_styling(full_width = FALSE)
+```
+
+
+```{r generalized linear model (glm) with binarized outcomes, table2}
+
+# caret glm
+# Use targeted panel TMB values as predictors of exome TMB outcome that has been binarized as high vs low in each sample
+# Exome TMB >= 10 sets sample outcome to TMB high; Exome TMB < 10 sets sample outcome to TMB low 
+# Evaluate KDL targeted panel and MSK targeted panel
+# Evaluate TCGA lung adenocarcinoma (LUAD) and skin cutaneous melanoma (SKCM) samples
+# Return F1, accuracy, sensitivity, specificity, PPV, NPV, precision, recall
+
+
+control <- trainControl(method = "cv", number = 10, p = 0.9)
+
+# Lung adenocarcinoma (LUAD)
+# KDL panel predictor and binarized exome outcome
+train_glm <- train(factor(sample_exome_TMB) ~ KDL_nonsyn_per_Mb, 
+                       data = train_LUAD, 
+                       method = "glm", 
+                       family = binomial,
+                       trControl = control)
+
+cm_glm<-confusionMatrix(data=predict(train_glm, test_LUAD), 
+                        reference=factor(test_LUAD$sample_exome_TMB))
+
+glm_results <- data_frame(Diagnosis = "LUAD",
+                          Predictor = "KDL panel",
+                          F1 = round(cm_glm$byClass["F1"],3),
+                          Accuracy = round(cm_glm$overall["Accuracy"],3),
+                          Sensitivity = round(cm_glm$byClass["Sensitivity"],3),
+                          Specificity = round(cm_glm$byClass["Specificity"],3),
+                          PPV = round(cm_glm$byClass["Pos Pred Value"],3),
+                          NPV = round(cm_glm$byClass["Neg Pred Value"],3)
+                          )
+
+
+# Lung adenocarcinoma (LUAD)
+# MSK panel predictor and binarized exome outcome
+train_glm <- train(factor(sample_exome_TMB) ~ MSK_nonsyn_per_Mb, 
+                       data = train_LUAD, 
+                       method = "glm", 
+                       family = binomial,
+                       trControl = control)
+
+cm_glm<-confusionMatrix(data=predict(train_glm, test_LUAD), 
+                        reference=factor(test_LUAD$sample_exome_TMB))
+
+glm_results <- bind_rows(glm_results,
+                         data_frame(Diagnosis = "LUAD",
+                          Predictor = "MSK panel",
+                          F1 = round(cm_glm$byClass["F1"],3),
+                          Accuracy = round(cm_glm$overall["Accuracy"],3),
+                          Sensitivity = round(cm_glm$byClass["Sensitivity"],3),
+                          Specificity = round(cm_glm$byClass["Specificity"],3),
+                          PPV = round(cm_glm$byClass["Pos Pred Value"],3),
+                          NPV = round(cm_glm$byClass["Neg Pred Value"],3)
+                          ))
+
+
+# Skin cutaneous melanoma (SKCM)
+# KDL panel predictor and binarized exome outcome
+train_glm <- train(factor(sample_exome_TMB) ~ KDL_nonsyn_per_Mb, 
+                       data = train_SKCM, 
+                       method = "glm", 
+                       family = binomial,
+                       trControl = control)
+
+cm_glm<-confusionMatrix(data=predict(train_glm, test_SKCM), 
+                        reference=factor(test_SKCM$sample_exome_TMB))
+
+glm_results <- bind_rows(glm_results,
+                          data_frame(Diagnosis = "SKCM",
+                          Predictor = "KDL panel",
+                          F1 = round(cm_glm$byClass["F1"],3),
+                          Accuracy = round(cm_glm$overall["Accuracy"],3),
+                          Sensitivity = round(cm_glm$byClass["Sensitivity"],3),
+                          Specificity = round(cm_glm$byClass["Specificity"],3),
+                          PPV = round(cm_glm$byClass["Pos Pred Value"],3),
+                          NPV = round(cm_glm$byClass["Neg Pred Value"],3)
+                          ))
+
+
+# Skin cutaneous melanoma (SKCM)
+# MSK panel predictor and binarized exome outcome
+train_glm <- train(factor(sample_exome_TMB) ~ MSK_nonsyn_per_Mb, 
+                       data = train_SKCM, 
+                       method = "glm", 
+                       family = binomial,
+                       trControl = control)
+
+cm_glm<-confusionMatrix(data=predict(train_glm, test_SKCM), 
+                        reference=factor(test_SKCM$sample_exome_TMB))
+
+glm_results <- bind_rows(glm_results,
+                          data_frame(Diagnosis = "SKCM",
+                          Predictor = "MSK panel",
+                          F1 = round(cm_glm$byClass["F1"],3),
+                          Accuracy = round(cm_glm$overall["Accuracy"],3),
+                          Sensitivity = round(cm_glm$byClass["Sensitivity"],3),
+                          Specificity = round(cm_glm$byClass["Specificity"],3),
+                          PPV = round(cm_glm$byClass["Pos Pred Value"],3),
+                          NPV = round(cm_glm$byClass["Neg Pred Value"],3)
+                          ))
+
+# knitr::kable(glm_results) %>%
+#   kable_styling(full_width = FALSE)
+```
+
+
+```{r locally weighted smoothing (loess) with binarized outcomes, fig7, table3}
+
+# caret gamLoess
+# Use targeted panel TMB values as predictors of exome TMB outcome that has been binarized as high vs low in each sample
+# Exome TMB >= 10 sets sample outcome to TMB high; Exome TMB < 10 sets sample outcome to TMB low 
+# Evaluate KDL targeted panel and MSK targeted panel
+# Evaluate TCGA lung adenocarcinoma (LUAD) and skin cutaneous melanoma (SKCM) samples
+# Return F1, accuracy, sensitivity, specificity, PPV, NPV, precision, recall
+# Optimize span
+
+
+grid<-expand.grid(span = seq(0.1, 1, 0.1), degree = 1)
+control <- trainControl(method = "cv", number = 10, p = 0.9)
+
+# Lung adenocarcinoma (LUAD)
+# KDL panel predictor and binarized exome outcome
+train_loess <- train(factor(sample_exome_TMB) ~ KDL_nonsyn_per_Mb,
+                     data = train_LUAD,
+                     method = "gamLoess", 
+                     tuneGrid = grid,
+                     trControl = control)
+
+#train_loess$bestTune
+loess_span_plot1 <-ggplot(train_loess, highlight = TRUE) + ggtitle("KDL panel, LUAD")
+
+y_hat_loess <- predict(train_loess, test_LUAD, type="raw")
+cm_loess <- confusionMatrix(y_hat_loess, factor(test_LUAD$sample_exome_TMB))
+
+loess_results <- data_frame(Diagnosis = "LUAD",
+                          Predictor = "KDL panel",
+                          F1 = round(cm_loess$byClass["F1"],3),
+                          Accuracy = round(cm_loess$overall["Accuracy"],3),
+                          Sensitivity = round(cm_loess$byClass["Sensitivity"],3),
+                          Specificity = round(cm_loess$byClass["Specificity"],3),
+                          PPV = round(cm_loess$byClass["Pos Pred Value"],3),
+                          NPV = round(cm_loess$byClass["Neg Pred Value"],3),
+                          Span = round(train_loess$bestTune$span,2)
+                          )
+
+
+# Lung adenocarcinoma (LUAD)
+# MSK panel predictor and binarized exome outcome
+train_loess <- train(factor(sample_exome_TMB) ~ MSK_nonsyn_per_Mb,
+                     data = train_LUAD,
+                     method = "gamLoess", 
+                     tuneGrid = grid,
+                     trControl = control)
+
+#train_loess$bestTune
+loess_span_plot2 <- ggplot(train_loess, highlight = TRUE) + ggtitle("MSK panel, LUAD")
+
+y_hat_loess <- predict(train_loess, test_LUAD, type="raw")
+cm_loess <- confusionMatrix(y_hat_loess, factor(test_LUAD$sample_exome_TMB))
+
+loess_results <- bind_rows(loess_results,
+                          data_frame(Diagnosis = "LUAD",
+                          Predictor = "MSK panel",
+                          F1 = round(cm_loess$byClass["F1"],3),
+                          Accuracy = round(cm_loess$overall["Accuracy"],3),
+                          Sensitivity = round(cm_loess$byClass["Sensitivity"],3),
+                          Specificity = round(cm_loess$byClass["Specificity"],3),
+                          PPV = round(cm_loess$byClass["Pos Pred Value"],3),
+                          NPV = round(cm_loess$byClass["Neg Pred Value"],3),
+                          Span = round(train_loess$bestTune$span,2)
+                          ))
+
+
+# Skin cutaneous melanoma (SKCM)
+# KDL panel predictor and binarized exome outcome
+train_loess <- train(factor(sample_exome_TMB) ~ KDL_nonsyn_per_Mb,
+                     data = train_SKCM,
+                     method = "gamLoess", 
+                     tuneGrid = grid,
+                     trControl = control)
+
+#train_loess$bestTune
+loess_span_plot3 <- ggplot(train_loess, highlight = TRUE) + ggtitle("KDL panel, SKCM")
+
+y_hat_loess <- predict(train_loess, test_SKCM, type="raw")
+cm_loess <- confusionMatrix(y_hat_loess, factor(test_SKCM$sample_exome_TMB))
+
+loess_results <- bind_rows(loess_results,
+                          data_frame(Diagnosis = "SKCM",
+                          Predictor = "KDL panel",
+                          F1 = round(cm_loess$byClass["F1"],3),
+                          Accuracy = round(cm_loess$overall["Accuracy"],3),
+                          Sensitivity = round(cm_loess$byClass["Sensitivity"],3),
+                          Specificity = round(cm_loess$byClass["Specificity"],3),
+                          PPV = round(cm_loess$byClass["Pos Pred Value"],3),
+                          NPV = round(cm_loess$byClass["Neg Pred Value"],3),
+                          Span = round(train_loess$bestTune$span,2)
+                          ))
+
+
+
+# Skin cutaneous melanoma (SKCM)
+# MSK panel predictor and binarized exome outcome
+train_loess <- train(factor(sample_exome_TMB) ~ MSK_nonsyn_per_Mb,
+                     data = train_SKCM,
+                     method = "gamLoess", 
+                     tuneGrid = grid,
+                     trControl = control)
+
+#train_loess$bestTune
+loess_span_plot4 <- ggplot(train_loess, highlight = TRUE) + ggtitle("MSK panel, SKCM")
+
+
+y_hat_loess <- predict(train_loess, test_SKCM, type="raw")
+cm_loess <- confusionMatrix(y_hat_loess, factor(test_SKCM$sample_exome_TMB))
+
+
+loess_results <- bind_rows(loess_results,
+                          data_frame(Diagnosis = "SKCM",
+                          Predictor = "MSK panel",
+                          F1 = round(cm_loess$byClass["F1"],3),
+                          Accuracy = round(cm_loess$overall["Accuracy"],3),
+                          Sensitivity = round(cm_loess$byClass["Sensitivity"],3),
+                          Specificity = round(cm_loess$byClass["Specificity"],3),
+                          PPV = round(cm_loess$byClass["Pos Pred Value"],3),
+                          NPV = round(cm_loess$byClass["Neg Pred Value"],3),
+                          Span = train_loess$bestTune$span
+                          ))
+
+#loess_spans <- grid.arrange(loess_span_plot1,
+                            # loess_span_plot2,
+                            # loess_span_plot3,
+                            # loess_span_plot4,
+                            # labels = c("A", "B", "C", "D"),
+                            # ncol = 2, 
+                            # nrow = 2)
+
+# knitr::kable(loess_results) %>%
+#   kable_styling(full_width = FALSE)
+```
+
+
+```{r fig1, fig.width = 9, fig.height = 6, fig.align = "center"}
+
+plot_Exome_TMB
+
+
+```
+
+
+```{r fig2, fig.width = 4, fig.height = 4, fig.align = "center"}
+
+TMB_density_plot
+
+```
+
+
+```{r fig3, fig.width = 4, fig.height = 4, fig.align = "center"}
+
+TMB_scaled_density_plot
+
+```
+
+
+```{r fig4, fig.width = 5, fig.height = 3, fig.align = "center"}
+
+TMB_QQ_plot
+
+```
+
+ 
+```{r fig5, fig.width = 4.5, fig.height = 3.5, fig.align = "center"}
+
+Exome_vs_KDL_lm
+
+```
+
+
+```{r fig6, fig.width = 4.5, fig.height = 3.5, fig.align = "center"}
+
+MSK_vs_KDL_lm
+
+```
+
+
+```{r table1 linear model results}
+
+knitr::kable(lm_results, align = rep('c',7)) %>%
+kable_styling(font_size = 10, full_width = FALSE)
+
+```
+
+
+```{r predictive model metrics}
+
+prediction_table <- read_excel("DataFiles/PredictionMetrics.xlsx", sheet = "prediction_table")
+
+knitr::kable(prediction_table) %>%
+kable_styling(font_size = 10, full_width = FALSE)
+
+```
+
+
+```{r predictive model metrics definitions}
+
+metric_definitions <- read_excel("DataFiles/PredictionMetrics.xlsx", sheet ="metric_definitions")
+
+knitr::kable(metric_definitions) %>%
+kable_styling(font_size = 10, full_width = FALSE)
+```
+
+
+```{r table2 logistic regression model results}
+
+knitr::kable(glm_results, align = rep('c',8)) %>%
+kable_styling(font_size = 10, full_width = FALSE)
+
+```
+
+
+```{r figure 7 loess smoothing optimal span}
+
+loess_spans <- grid.arrange(loess_span_plot1,
+                            loess_span_plot2,
+                            loess_span_plot3,
+                            loess_span_plot4,
+                            ncol = 2)
+
+
+```
+
+
+```{r table3 loess model results}
+
+knitr::kable(loess_results, align = rep('c',9)) %>%
+  kable_styling(font_size = 10, full_width = FALSE)
+
+```
+
+
+
+
+
+
